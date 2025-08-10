@@ -1,2 +1,4 @@
 Flask==3.0.3
 yt-dlp==2025.01.12
+# Added for Render web service start command
+gunicorn==21.2.0
