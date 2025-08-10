@@ -6,6 +6,7 @@ import glob
 import time
 from yt_dlp import YoutubeDL
 import base64
+from typing import Optional
 
 app = Flask(__name__)
 
@@ -17,6 +18,22 @@ def _select_latest_file(directory_path: str, extension_glob: str) -> str:
         return ""
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
+
+
+def _locate_ffmpeg_dir() -> Optional[str]:
+    # Allow override via env
+    env_path = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_DIR")
+    if env_path:
+        if os.path.isdir(env_path):
+            return env_path
+        parent = os.path.dirname(env_path)
+        if os.path.exists(env_path) and os.path.isfile(env_path):
+            return parent
+    # Bundled static build
+    bundled = os.path.join(os.path.dirname(__file__), "tools", "ffmpeg-7.0.2-amd64-static")
+    if os.path.exists(os.path.join(bundled, "ffmpeg")):
+        return bundled
+    return None
 
 
 @app.route("/")
@@ -194,6 +211,16 @@ def download():
         if cookiefile_path:
             base_opts["cookiefile"] = cookiefile_path
 
+        # Proxy support via env
+        proxy = os.environ.get("YTDLP_PROXY")
+        if proxy:
+            base_opts["proxy"] = proxy
+
+        # Ensure ffmpeg is available
+        ffmpeg_dir = _locate_ffmpeg_dir()
+        if ffmpeg_dir:
+            base_opts["ffmpeg_location"] = ffmpeg_dir
+
         if target_format == "mp3":
             ydl_opts = {
                 **base_opts,
@@ -244,13 +271,15 @@ def download():
         )
 
     except Exception as exc:
-        # Provide a clearer message for common YouTube auth requirement
+        # Provide clearer messages for common cases
         msg = str(exc)
         if "Sign in to confirm" in msg or "private" in msg.lower():
             msg = (
                 "This video requires authentication or cookies. "
                 "Paste exported YouTube cookies in Advanced or set YTDLP_COOKIES_B64."
             )
+        if "ffmpeg" in msg.lower():
+            msg += " If the issue persists, set FFMPEG_PATH or include ffmpeg in PATH."
         return jsonify({"error": msg}), 500
 
 
