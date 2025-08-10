@@ -5,6 +5,8 @@ import shutil
 import glob
 import time
 from yt_dlp import YoutubeDL
+import base64
+from typing import Optional
 
 app = Flask(__name__)
 
@@ -16,6 +18,22 @@ def _select_latest_file(directory_path: str, extension_glob: str) -> str:
         return ""
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
+
+
+def _locate_ffmpeg_dir() -> Optional[str]:
+    # Allow override via env
+    env_path = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_DIR")
+    if env_path:
+        if os.path.isdir(env_path):
+            return env_path
+        parent = os.path.dirname(env_path)
+        if os.path.exists(env_path) and os.path.isfile(env_path):
+            return parent
+    # Bundled static build
+    bundled = os.path.join(os.path.dirname(__file__), "tools", "ffmpeg-7.0.2-amd64-static")
+    if os.path.exists(os.path.join(bundled, "ffmpeg")):
+        return bundled
+    return None
 
 
 @app.route("/")
@@ -38,6 +56,9 @@ def index():
     .status { min-height: 1.25rem; color: #444; font-size: 0.95rem; }
     .hint { color: #666; font-size: 0.9rem; }
     .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 1rem; background: #fafafa; }
+    details { margin-top: 0.5rem; }
+    textarea { width: 100%; min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 0.9rem; padding: 0.6rem; border: 1px solid #ccc; border-radius: 8px; }
+    .subtle { color: #666; font-size: 0.85rem; }
   </style>
 </head>
 <body>
@@ -55,6 +76,12 @@ def index():
         <label><input type=\"radio\" name=\"format\" value=\"mp4\" /> MP4 (highest quality)</label>
       </div>
 
+      <details>
+        <summary>Advanced (optional cookies)</summary>
+        <div class=\"subtle\" style=\"margin: 0.25rem 0 0.5rem;\">Paste an exported YouTube cookies file (Netscape/yt-dlp format). Used only for this request to bypass sign-in or bot checks.</div>
+        <textarea id=\"cookies\" placeholder=\"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\"></textarea>
+      </details>
+
       <div class=\"row\">
         <button id=\"download-btn\" type=\"submit\">Convert & Download</button>
       </div>
@@ -68,11 +95,20 @@ def index():
     const form = document.getElementById('convert-form');
     const statusEl = document.getElementById('status');
     const button = document.getElementById('download-btn');
+    const cookiesEl = document.getElementById('cookies');
 
     function setBusy(isBusy, message = '') {
       button.disabled = isBusy;
       statusEl.textContent = message;
       button.textContent = isBusy ? 'Processing…' : 'Convert & Download';
+    }
+
+    function toBase64Unicode(str) {
+      try {
+        return btoa(unescape(encodeURIComponent(str)));
+      } catch (e) {
+        return '';
+      }
     }
 
     form.addEventListener('submit', async (e) => {
@@ -88,10 +124,14 @@ def index():
       setBusy(true, 'Fetching and converting to ' + format.toUpperCase() + '…');
 
       try {
+        const cookiesText = (cookiesEl?.value || '').trim();
+        const payload = { url, format };
+        if (cookiesText) payload.cookies_b64 = toBase64Unicode(cookiesText);
+
         const response = await fetch('/api/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, format })
+          body: JSON.stringify(payload)
         });
         if (!response.ok) {
           const err = await response.json().catch(() => ({}));
@@ -151,13 +191,40 @@ def download():
             pass
         return response
 
+    # Optional cookies support (from request or environment)
+    cookiefile_path = None
     try:
+        cookies_b64 = (data.get("cookies_b64") or os.environ.get("YTDLP_COOKIES_B64") or "").strip()
+        if cookies_b64:
+            cookiefile_path = os.path.join(temp_dir, "cookies.txt")
+            with open(cookiefile_path, "wb") as f:
+                f.write(base64.b64decode(cookies_b64))
+    except Exception:
+        cookiefile_path = None
+
+    try:
+        base_opts = {
+            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+            "quiet": True,
+            "noprogress": True,
+        }
+        if cookiefile_path:
+            base_opts["cookiefile"] = cookiefile_path
+
+        # Proxy support via env
+        proxy = os.environ.get("YTDLP_PROXY")
+        if proxy:
+            base_opts["proxy"] = proxy
+
+        # Ensure ffmpeg is available
+        ffmpeg_dir = _locate_ffmpeg_dir()
+        if ffmpeg_dir:
+            base_opts["ffmpeg_location"] = ffmpeg_dir
+
         if target_format == "mp3":
             ydl_opts = {
+                **base_opts,
                 "format": "bestaudio/best",
-                "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-                "quiet": True,
-                "noprogress": True,
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -168,11 +235,9 @@ def download():
             }
         else:  # mp4
             ydl_opts = {
+                **base_opts,
                 "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
                 "merge_output_format": "mp4",
-                "quiet": True,
-                "noprogress": True,
             }
 
         with YoutubeDL(ydl_opts) as ydl:
@@ -206,7 +271,16 @@ def download():
         )
 
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        # Provide clearer messages for common cases
+        msg = str(exc)
+        if "Sign in to confirm" in msg or "private" in msg.lower():
+            msg = (
+                "This video requires authentication or cookies. "
+                "Paste exported YouTube cookies in Advanced or set YTDLP_COOKIES_B64."
+            )
+        if "ffmpeg" in msg.lower():
+            msg += " If the issue persists, set FFMPEG_PATH or include ffmpeg in PATH."
+        return jsonify({"error": msg}), 500
 
 
 if __name__ == "__main__":
